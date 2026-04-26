@@ -27,6 +27,26 @@ header ipv4_t {
     IPv4Address dst_addr;
 }
 
+header tcp_t {
+    bit<16> src_port;
+    bit<16> dst_port;
+    bit<32> seq_no;
+    bit<32> ack_no;
+    bit<4>  data_offset;
+    bit<4>  res;
+    bit<1>  cwr;
+    bit<1>  ece;
+    bit<1>  urg;
+    bit<1>  ack;
+    bit<1>  psh;
+    bit<1>  rst;
+    bit<1>  syn;
+    bit<1>  fin;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgent_ptr;
+}
+
 header arp_t {
     bit<16> htype;
     bit<16> ptype;
@@ -42,7 +62,12 @@ header arp_t {
 struct headers_t {
     ethernet_t ethernet;
     ipv4_t     ipv4;
+    tcp_t      tcp;
     arp_t      arp;
+}
+
+struct scan_alert_t {
+    IPv4Address attacker_ip;
 }
 
 // We use this metadata to hold either the IPv4 Dest or the ARP Target IP
@@ -77,8 +102,16 @@ parser my_parser(packet_in packet,
         packet.extract(hd.ipv4);
         verify(hd.ipv4.version == 4w4, error.IPv4IncorrectVersion);
         verify(hd.ipv4.ihl == 4w5, error.IPv4OptionsNotSupported);
+        transition select(hd.ipv4.protocol) {
+            6: parse_tcp;
+            default: accept;
+        }
+    }
+
+    state parse_tcp {
+        packet.extract(hd.tcp);
         transition accept;
-    }    
+    }
 
     state parse_arp {
         packet.extract(hd.arp);
@@ -94,6 +127,7 @@ control my_deparser(packet_out packet, in headers_t hdr)
         packet.emit(hdr.ethernet);
         packet.emit(hdr.ipv4);
         packet.emit(hdr.arp);
+        packet.emit(hdr.tcp);
     }
 }
 
@@ -127,6 +161,10 @@ control my_ingress(inout headers_t hdr,
                   inout standard_metadata_t standard_metadata)
 {
     bool dropped = false;
+    // 1024 slots for counts
+    register<bit<32>>(1024) syn_counters;
+    // 1024 slots for timestamps (v1model timestamps are 48-bit)
+    register<bit<48>>(1024) last_syn_timestamps;
 
     action drop_action() {
         mark_to_drop(standard_metadata);
@@ -164,6 +202,38 @@ control my_ingress(inout headers_t hdr,
     }
 
     apply {
+        // --- INTRUSION DETECTION SYSTEM ---
+        if (hdr.ipv4.isValid() && hdr.tcp.isValid() && hdr.tcp.syn == 1) {
+            bit<32> syn_count;
+            bit<48> last_time;
+            bit<48> current_time = standard_metadata.ingress_global_timestamp;
+            
+            bit<32> index = (bit<32>) hdr.ipv4.src_addr & 1023;
+
+            // Read the memory
+            syn_counters.read(syn_count, index);
+            last_syn_timestamps.read(last_time, index);
+
+            // RATE MEASUREMENT: Did the last SYN happen more than 1 second ago?
+            // (1,000,000 microseconds = 1 second)
+            if (current_time - last_time > 1000000) {
+                // Too much time passed. Reset the counter.
+                syn_count = 1;
+            } else {
+                // It happened fast! Increment the counter.
+                syn_count = syn_count + 1;
+            }
+
+            // Write the new data back to memory
+            syn_counters.write(index, syn_count);
+            last_syn_timestamps.write(index, current_time);
+
+            // Check the threshold (e.g., 3 SYNs within 1 second)
+            if (syn_count == 3) {
+                // 100 is our arbitrary "Mirror Session ID"
+                clone(CloneType.I2E, 100);
+            }
+        }
         // 1. Extract the target IP address depending on the packet type
         if (hdr.ipv4.isValid()) {
             meta.routing_dst_addr = hdr.ipv4.dst_addr;
