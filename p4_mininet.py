@@ -124,6 +124,9 @@ class P4Switch(Switch):
             args.extend(['--thrift-port', str(self.thrift_port)])
         if self.nanomsg:
             args.extend(['--nanolog', self.nanomsg])
+        notif_path = f"ipc:///tmp/bmv2-{self.device_id}-notifications.ipc"
+        args.extend(['--notifications-addr', notif_path])
+        args.extend(['--log-level', 'trace'])
         args.extend(['--device-id', str(self.device_id)])
         P4Switch.device_id += 1
         args.append(self.json_path)

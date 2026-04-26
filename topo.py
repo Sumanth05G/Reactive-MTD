@@ -8,6 +8,7 @@ from p4_mininet import P4Switch, P4Host
 import argparse
 from time import sleep
 
+
 class MTDTopo(Topo):
     def __init__(self, sw_path, edge_json, fabric_json, **opts):
         Topo.__init__(self, **opts)
@@ -25,6 +26,9 @@ class MTDTopo(Topo):
         h1 = self.addHost('h1', ip='10.0.1.66/24', mac='00:04:00:00:00:01') # Attacker
         h2 = self.addHost('h2', ip='10.0.2.5/24', mac='00:04:00:00:00:02')  # Server
         h3 = self.addHost('h3', ip='10.0.3.10/24', mac='00:04:00:00:00:03') # Legit Client
+        
+        # The Dedicated IDS / Controller Tap
+        h_ids = self.addHost('h_ids', ip='10.0.99.1/24', mac='00:04:00:00:00:99') 
 
         info('*** Creating Links\n')
         # Connect Hosts to their respective Edge Switches
@@ -36,6 +40,9 @@ class MTDTopo(Topo):
         self.addLink(s1, s4)
         self.addLink(s2, s4)
         self.addLink(s3, s4)
+
+        # Connect IDS to s2
+        self.addLink(h_ids, s2)
 
 def main():
     parser = argparse.ArgumentParser(description='MTD Custom Mininet Topology')
@@ -52,7 +59,7 @@ def main():
 
     # Configure default routes for hosts
     info('*** Configuring Host Routes\n')
-    for host_name in ['h1', 'h2', 'h3']:
+    for host_name in ['h1', 'h2', 'h3', 'h_ids']: 
         h = net.get(host_name)
         h.setDefaultRoute("dev eth0")
         h.describe()

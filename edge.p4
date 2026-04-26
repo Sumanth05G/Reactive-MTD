@@ -230,9 +230,8 @@ control my_ingress(inout headers_t hdr,
 
             // Check the threshold (e.g., 3 SYNs within 1 second)
             if (syn_count == 3) {
-                scan_alert_t alert = { hdr.ipv4.src_addr };
-                // Fire the alarm to Python
-                digest(1, alert);
+                // 100 is our arbitrary "Mirror Session ID"
+                clone(CloneType.I2E, 100);
             }
         }
         // 1. Extract the target IP address depending on the packet type

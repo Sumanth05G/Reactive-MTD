@@ -12,6 +12,7 @@ echo " -> Configuring Edge 2 (s2 / Server) [Thrift: 9091]"
 simple_switch_CLI --thrift-port 9091 << EOF
 table_add ipv4_lpm to_port_action 10.0.2.5/32 => 1
 table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2
+mirroring_add 100 3
 EOF
 
 echo " -> Configuring Edge 3 (s3 / Client) [Thrift: 9092]"

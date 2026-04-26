@@ -54,6 +54,8 @@ def initialize_static_network():
         # We must route the Virtual Subnet (192.168.50.X) to S2!
         "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
 
+    push_p4_rules(S2_PORT, "mirroring_add 100 3\n")
+
 def calculate_virtual_ip(seq_num):
     """PRNG Math to calculate the new vIP"""
     raw_string = f"{REAL_IP}:{SEED}:{seq_num}"
