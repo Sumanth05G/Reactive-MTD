@@ -1,47 +1,82 @@
-# Reactive Moving Target Defense (MTD) using P4 & SDN
+# Reactive Moving Target Defense (MTD) in Mininet
 
 ## Overview
-This is a Minimum Viable Product (MVP) for an SDN-based Moving Target Defense system. It protects a backend server from reconnaissance by dynamically mutating its IP address. The control plane orchestrates the mutations, while the P4 data plane handles bidirectional Network Address Translation (NAT) transparently at line rate.
+This project implements a **Reactive Moving Target Defense (MTD)** architecture using Mininet and P4 programmable switches. The network actively defends a backend server from reconnaissance attacks (e.g., port scans) by mutating the server's Virtual IP in real-time.
 
-## Current System State (MVP)
-* **Synchronized PRNG:** Both the SDN Controller and the Legitimate Client independently calculate the same Virtual IP (vIP) using a shared secret (`SEED`) and a sequence number.
-* **Dynamic Data Plane:** The Python controller dynamically pushes rule updates to the BMv2 switches via Thrift to map the vIP to the Real IP.
-* **Bidirectional NAT & ARP:** The BMv2 switches natively handle DNAT (Inbound) and SNAT (Outbound) for both IPv4 and ARP packets. No host-level ARP static routes (`arp -s`) are required.
-* **End-to-End Reachability:** ICMP `ping` successfully routes from the client namespace to the mutated vIP.
+When a volumetric attack is detected by the P4 switch, the Python controller updates routing tables and injects an out-of-band UDP beacon to the legitimate client. The client agent intercepts this beacon, calculates the new cryptographic IP, and automatically reconnects to the new secure target, rendering the old IP obsolete for attackers.
 
-## Topology
-Standard Spine-Leaf setup using Mininet and `simple_switch` (BMv2):
-* **h1 (Attacker):** `10.0.1.66` connected to Edge Switch `s1`
-* **h2 (Server):** `10.0.2.5` connected to Edge Switch `s2` (NAT Target)
-* **h3 (Client):** `10.0.3.10` connected to Edge Switch `s3`
-* **s4 (Fabric):** Central backbone connecting `s1`, `s2`, and `s3`.
-* **Virtual Subnet:** `192.168.50.0/24` (All vIPs are constrained to this block).
+## Prerequisites
+- Mininet
+- BMv2 (`simple_switch_CLI`)
+- Python 3.x
+- Scapy (requires `sudo` privileges)
 
-## Execution Guide
+## Running and Testing
 
-### 1. Boot the Data Plane
-Compile the P4 program and launch the Mininet topology:
+**Note:** The SDN controller requires root access to sniff and inject packets. Clients and servers run inside isolated Mininet namespaces.
+
+### 1. Start the Mininet Data Plane
+Open Terminal 1:
 ```bash
-p4c-bm2-ss --p4v 16 basic_routing.p4 -o basic_routing.json
-sudo python3 topo.py --behavioral-exe simple_switch --edge_json basic_routing.json --fabric_json basic_routing.json
+sudo python3 topo.py --edge_json edge.json --fabric_json fabric.json
+````
+
+### 2. Start the MTD Controller
+
+Open Terminal 2 (host OS):
+
+```bash
+sudo python3 reactive_controller.py
 ```
 
-### 2. Start the Client Agent (Host OS)
-Open a new terminal (outside of Mininet) and run the client agent to listen for Controller beacons:
+> Wait for initialization. The initial "Patient Zero" Virtual IP will be printed.
+
+### 3. Start the Backend Server (h2)
+
+From the Mininet CLI:
+
 ```bash
-sudo python3 mtd_agent.py
+mininet> xterm h2
 ```
 
-### 3. Start the SDN Controller (Host OS)
-Open a third terminal and execute the controller. It will push static routes, establish the first vIP NAT mapping on `s2`, and broadcast the UDP beacon:
+Inside the `h2` terminal:
+
 ```bash
-sudo python3 controller.py
+python3 h2_server.py
 ```
 
-### 4. Verify End-to-End Reachability
-1. Check the `mtd_agent.py` terminal to see the newly calculated Virtual IP (e.g., `192.168.50.144`).
-2. Inside the Mininet CLI, initiate a ping from the client host to the Virtual IP:
+### 4. Start the Client Agents (h3)
+
+Open two terminals for the client node:
+
 ```bash
-mininet> h3 ping <Virtual_IP>
+mininet> xterm h3 h3
 ```
-*Expected Result:* Successful ICMP echo replies, proving the P4 switch is successfully performing DNAT/SNAT on the traffic.
+
+* **First `h3` terminal:** Run the background UDP listener:
+
+  ```bash
+  python3 h3_agent.py
+  ```
+* **Second `h3` terminal:** Run the active TCP client:
+
+  ```bash
+  python3 h3_client.py
+  ```
+
+### 5. Launch the Attack (h1)
+
+From the main Mininet CLI:
+
+```bash
+mininet> h1 hping3 -S -p 80 -c 4 -i u10000 <CURRENT_VIRTUAL_IP>
+```
+
+## Expected Behavior
+
+During an attack, observe this sequence:
+
+1. **Controller:** Detects attack, updates NAT tables, and injects UDP notification beacon.
+2. **Client Agent (h3):** Intercepts the beacon and computes the next Virtual IP.
+3. **Client TCP (h3):** Reconnects to the new secure Virtual IP.
+4. **Server (h2):** Drops the old connection and accepts the new one seamlessly.
