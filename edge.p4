@@ -75,6 +75,7 @@ struct metadata_t {
     IPv4Address routing_dst_addr;
     IPv4Address translated_ip;    // Holds the new IP from the NAT action
     bit<2>      nat_type;         // 0 = None, 1 = DNAT, 2 = SNAT
+    bit<16> tcp_length;
 }
 
 error {
@@ -151,6 +152,18 @@ control my_compute_checksum(inout headers_t hdr, inout metadata_t meta) {
               hdr.ipv4.dst_addr },
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
+
+        // Update TCP Checksum (Using the length we calculated in Ingress!)
+        update_checksum_with_payload(
+            hdr.tcp.isValid(),
+            { hdr.ipv4.src_addr, hdr.ipv4.dst_addr, 8w0, hdr.ipv4.protocol,
+              meta.tcp_length, 
+              hdr.tcp.src_port, hdr.tcp.dst_port, hdr.tcp.seq_no, hdr.tcp.ack_no,
+              hdr.tcp.data_offset, hdr.tcp.res, hdr.tcp.cwr, hdr.tcp.ece,
+              hdr.tcp.urg, hdr.tcp.ack, hdr.tcp.psh, hdr.tcp.rst,
+              hdr.tcp.syn, hdr.tcp.fin, hdr.tcp.window, hdr.tcp.urgent_ptr },
+            hdr.tcp.checksum,
+            HashAlgorithm.csum16);
     }
 }
 
@@ -202,6 +215,11 @@ control my_ingress(inout headers_t hdr,
     }
 
     apply {
+        // Calculate TCP Length for the Checksum Engine (Total IPv4 length minus IPv4 Header length)
+        if (hdr.ipv4.isValid() && hdr.tcp.isValid()) {
+            meta.tcp_length = hdr.ipv4.total_len - ((bit<16>)hdr.ipv4.ihl << 2);
+        }
+        
         // --- INTRUSION DETECTION SYSTEM ---
         if (hdr.ipv4.isValid() && hdr.tcp.isValid() && hdr.tcp.syn == 1) {
             bit<32> syn_count;
