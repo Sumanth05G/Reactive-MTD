@@ -74,6 +74,7 @@ struct scan_alert_t {
 struct metadata_t {
     IPv4Address routing_dst_addr;
     IPv4Address translated_ip;    // Holds the new IP from the NAT action
+    bit<16>     translated_port;
     bit<2>      nat_type;         // 0 = None, 1 = DNAT, 2 = SNAT
     bit<16> tcp_length;
 }
@@ -188,14 +189,16 @@ control my_ingress(inout headers_t hdr,
         standard_metadata.egress_spec = port;
     }
 
-    action dnat_action(IPv4Address real_ip, bit<9> port) {
+    action dnat_action(IPv4Address real_ip, bit<16> real_port, bit<9> port) {
         meta.translated_ip = real_ip;
+        meta.translated_port = real_port;
         meta.nat_type = 1; // Flag for DNAT
         standard_metadata.egress_spec = port;
     }
 
-    action snat_and_route(IPv4Address virtual_ip, bit<9> port) {
+    action snat_and_route(IPv4Address virtual_ip, bit<16> virtual_port, bit<9> port) {
         meta.translated_ip = virtual_ip;
+        meta.translated_port = virtual_port;
         meta.nat_type = 2; // Flag for SNAT
         standard_metadata.egress_spec = port;
     }
@@ -269,11 +272,13 @@ control my_ingress(inout headers_t hdr,
             // It's DNAT (Inbound to Server)
             if (hdr.ipv4.isValid()) { hdr.ipv4.dst_addr = meta.translated_ip; }
             if (hdr.arp.isValid()) { hdr.arp.proto_dst_addr = meta.translated_ip; }
+            if (hdr.tcp.isValid()) { hdr.tcp.dst_port = meta.translated_port; }
         } 
         else if (meta.nat_type == 2) {
             // It's SNAT (Outbound from Server)
             if (hdr.ipv4.isValid()) { hdr.ipv4.src_addr = meta.translated_ip; }
             if (hdr.arp.isValid()) { hdr.arp.proto_src_addr = meta.translated_ip; }
+            if (hdr.tcp.isValid()) { hdr.tcp.src_port = meta.translated_port; }
         }
     }
 }

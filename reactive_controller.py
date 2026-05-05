@@ -6,6 +6,7 @@ from scapy.all import sniff, IP, TCP, Ether, UDP, sendp
 
 # --- MTD VARIABLES ---
 REAL_IP = "10.0.2.5"
+REAL_SERVER_PORT = 80
 SEED = "CS6045_Secret"
 CLIENT_IP = "10.0.3.10"  # Target IP for h3
 CLIENT_UDP_PORT = 9999
@@ -70,23 +71,34 @@ def calculate_virtual_ip(seq_num):
     v_host = (hash_int % 253) + 1
     return f"192.168.50.{v_host}"
 
+def calculate_virtual_port(seq_num):
+    """PRNG Math to calculate the new vPort"""
+    raw_string = f"PORT:{REAL_IP}:{SEED}:{seq_num}"
+    hash_object = hashlib.sha256(raw_string.encode('utf-8'))
+    hash_int = int(hash_object.hexdigest(), 16)
+    
+    # Generate a port between 10000 and 60000
+    v_port = 10000 + (hash_int % 50000)
+    return str(v_port)
+
 def mutate_server(sequence_number):
     global active_vip
 
     vIP = calculate_virtual_ip(sequence_number)
+    vPort = calculate_virtual_port(sequence_number)
     active_vip = vIP  # Update the active IP state
 
     print(f"\n==========================================")
-    print(f"[*] MUTATION {sequence_number} | Target: {vIP}")
+    print(f"[*] MUTATION {sequence_number} | Target: {vIP}:{vPort}")
 
     # 1. Update S2 (The Server's Switch)
     s2_rules = (
         "table_clear ipv4_lpm\n"
-        f"table_add ipv4_lpm snat_and_route 10.0.0.0/16 => {vIP} 2\n"
-        f"table_add ipv4_lpm dnat_action {vIP}/32 => {REAL_IP} 1\n"
+        f"table_add ipv4_lpm snat_and_route 10.0.0.0/16 => {vIP} {vPort} 2\n"
+        f"table_add ipv4_lpm dnat_action {vIP}/32 => {REAL_IP} {REAL_SERVER_PORT} 1\n"
     )
     push_p4_rules(S2_PORT, s2_rules)
-    print(f"[*] P4 Switch S2 Updated: {vIP} translates to {REAL_IP}")
+    print(f"[*] P4 Switch S2 Updated: {vIP}:{vPort} translates to {REAL_IP}:{REAL_SERVER_PORT}")
 
     # 2. Alert the Client via Direct Packet Injection
     message = f"SERVER_DB:SEQ_{sequence_number}"
