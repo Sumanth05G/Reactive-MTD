@@ -1,98 +1,76 @@
 import socket
-import hashlib
 import time
-import threading
+import sys
 
-REAL_IP = "10.0.2.5"
-SEED = "CS6045_Secret"
-LISTEN_PORT = 9999
+IPC_PORT = 5050
 SERVER_PORT = 80
 
-# Global state
-seq = 0
-current_vip = None
-active_socket = None
-socket_lock = threading.Lock()
+# Linux constant for TCP_USER_TIMEOUT (usually 18)
+TCP_USER_TIMEOUT = 18
 
-def calculate_virtual_ip(seq_num):
-    raw_string = f"{REAL_IP}:{SEED}:{seq_num}"
-    hash_object = hashlib.sha256(raw_string.encode('utf-8'))
-    hash_int = int(hash_object.hexdigest(), 16)
-    v_host = (hash_int % 253) + 1
-    return f"192.168.50.{v_host}"
-
-def listen_for_beacon():
-    """Background thread waiting for the Controller's UDP packet"""
-    global current_vip, seq, active_socket
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", LISTEN_PORT))
-
-    while True:
-        data, addr = sock.recvfrom(1024)
-        message = data.decode('utf-8')
-
-        if "SEQ_" in message:
-            new_seq = int(message.split("SEQ_")[1])
-            if new_seq > seq:
-                seq = new_seq
-                current_vip = calculate_virtual_ip(seq)
-                print(f"\n[!] BEACON RECEIVED: Controller signaled mutation!")
-                print(f"[*] New Secure Target: {current_vip}")
-
-                # Tear down the active connection to trigger a reconnect
-                with socket_lock:
-                    if active_socket:
-                        active_socket.close()
-                        active_socket = None
+def get_active_vip():
+    """Queries the local h3_agent daemon for the current Virtual IP"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.connect(("127.0.0.1", IPC_PORT))
+            vip = sock.recv(1024).decode('utf-8')
+            return vip if vip != "WAIT" else None
+    except ConnectionRefusedError:
+        return None
 
 def run_tcp_client():
-    """Foreground thread streaming data to the server"""
-    global active_socket, current_vip
+    counter = 1
+
+    current_vip = get_active_vip()
+    while not current_vip:
+        print("[*] Waiting for agent to provide initial route...")
+        time.sleep(1)
+        current_vip = get_active_vip()
 
     while True:
-        if current_vip is None:
-            time.sleep(0.5)
-            continue
-
-        print(f"\n[*] Connecting to {current_vip}:{SERVER_PORT}...")
-
-        with socket_lock:
-            active_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            active_socket.settimeout(2.0)
+        print(f"\n[*] Connecting to target: {current_vip}:{SERVER_PORT}...")
 
         try:
+            active_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            # 1. Timeout for connection establishment
+            active_socket.settimeout(3.0)
+
+            # 2. THE FIX: Force Linux to kill the socket if ACKs stop arriving for 3000ms
+            # This prevents the "TCP Blackhole" retransmission hang
+            if sys.platform.startswith('linux'):
+                active_socket.setsockopt(socket.IPPROTO_TCP, TCP_USER_TIMEOUT, 3000)
+
             active_socket.connect((current_vip, SERVER_PORT))
             print(f"[+] Connected! Transmitting data...")
 
-            counter = 1
             while True:
                 message = f"Legitimate payload packet #{counter} (Targeting {current_vip})\n"
-                with socket_lock:
-                    if active_socket is None:
-                        break # Socket was killed by the beacon thread
-                    active_socket.sendall(message.encode('utf-8'))
+                active_socket.sendall(message.encode('utf-8'))
                 counter += 1
                 time.sleep(1)
 
-        except (socket.timeout, ConnectionRefusedError, BrokenPipeError, OSError):
-            print(f"[-] Connection broken. Waiting for new routing instructions...")
-            with socket_lock:
-                if active_socket:
-                    active_socket.close()
-                    active_socket = None
-            time.sleep(1)
+        except (socket.timeout, ConnectionRefusedError, BrokenPipeError, OSError) as e:
+            print(f"\n[!] Connection severed by L4 exception: {type(e).__name__}")
+            active_socket.close()
+
+            print("[*] Checking agent for SDN route mutation...")
+            time.sleep(1) # Give the SDN controller a second to update the agent
+
+            latest_vip = get_active_vip()
+
+            if latest_vip and latest_vip != current_vip:
+                print(f"[+] Route mutation confirmed! Shifting to new target: {latest_vip}")
+                current_vip = latest_vip
+                continue
+            else:
+                print("[-] Route is unchanged. This is a genuine network failure.")
+                print("[-] Terminating application.")
+                break
 
 if __name__ == "__main__":
-    current_vip = calculate_virtual_ip(seq)
-    print("[*] Legitimate Client Agent Started.")
-    print(f"[*] Initial Virtual IP is {current_vip}")
-
-    # Start the UDP listener in the background
-    threading.Thread(target=listen_for_beacon, daemon=True).start()
-
-    # Run the TCP client in the foreground
+    print("[*] Legitimate Client App Started.")
     try:
         run_tcp_client()
     except KeyboardInterrupt:
-        print("\n[*] Client agent shutting down.")
+        print("\n[*] Client shutting down.")
