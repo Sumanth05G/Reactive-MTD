@@ -46,6 +46,12 @@ def initialize_static_network():
         "table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2\n"
         "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
 
+    # S2 (Server Edge): Route to h2, else Fabric. + Hardware Mirroring
+    push_p4_rules(S2_PORT,
+        "table_add ipv4_lpm to_port_action 10.0.2.5/32 => 1\n"
+        "table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2\n"
+        "mirroring_add 100 3\n")
+
     # S3: Route to h3, else Fabric
     push_p4_rules(S3_PORT,
         "table_add ipv4_lpm to_port_action 10.0.3.10/32 => 1\n"
@@ -56,11 +62,7 @@ def initialize_static_network():
     push_p4_rules(S4_PORT,
         "table_add ipv4_lpm to_port_action 10.0.1.0/24 => 1\n"
         "table_add ipv4_lpm to_port_action 10.0.3.0/24 => 3\n"
-        # We must route the Virtual Subnet (192.168.50.X) to S2!
         "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
-
-    # Set up the Hardware Port Mirror to out-of-band port 3
-    push_p4_rules(S2_PORT, "mirroring_add 100 3\n")
 
 def calculate_virtual_ip(seq_num):
     """PRNG Math to calculate the new vIP"""
@@ -93,9 +95,16 @@ def mutate_server(sequence_number):
 
     # 1. Update S2 (The Server's Switch)
     s2_rules = (
-        "table_clear ipv4_lpm\n"
-        f"table_add ipv4_lpm snat_and_route 10.0.0.0/16 => {vIP} {vPort} 2\n"
-        f"table_add ipv4_lpm dnat_action {vIP}/32 => {REAL_IP} {REAL_SERVER_PORT} 1\n"
+        "table_clear inbound_tcp_nat\n"
+        "table_clear outbound_tcp_nat\n"
+        "table_clear inbound_ip_nat\n"
+        "table_clear outbound_ip_nat\n"
+        
+        f"table_add inbound_tcp_nat dnat_tcp_action {vIP} {vPort} => {REAL_IP} {REAL_SERVER_PORT}\n"
+        f"table_add outbound_tcp_nat snat_tcp_action {REAL_IP} {REAL_SERVER_PORT} => {vIP} {vPort}\n"
+        
+        f"table_add inbound_ip_nat dnat_ip_action {vIP} => {REAL_IP}\n"
+        f"table_add outbound_ip_nat snat_ip_action {REAL_IP} => {vIP}\n"
     )
     push_p4_rules(S2_PORT, s2_rules)
     print(f"[*] P4 Switch S2 Updated: {vIP}:{vPort} translates to {REAL_IP}:{REAL_SERVER_PORT}")
