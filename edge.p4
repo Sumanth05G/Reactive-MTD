@@ -70,13 +70,10 @@ struct scan_alert_t {
     IPv4Address attacker_ip;
 }
 
-// We use this metadata to hold either the IPv4 Dest or the ARP Target IP
 struct metadata_t {
     IPv4Address routing_dst_addr;
-    IPv4Address translated_ip;    // Holds the new IP from the NAT action
-    bit<16>     translated_port;
-    bit<2>      nat_type;         // 0 = None, 1 = DNAT, 2 = SNAT
-    bit<16> tcp_length;
+    IPv4Address routing_src_addr;
+    bit<16>     tcp_length;
 }
 
 error {
@@ -180,6 +177,7 @@ control my_ingress(inout headers_t hdr,
     // 1024 slots for timestamps (v1model timestamps are 48-bit)
     register<bit<48>>(1024) last_syn_timestamps;
 
+    // --- BASIC ACTIONS ---
     action drop_action() {
         mark_to_drop(standard_metadata);
         dropped = true;
@@ -189,28 +187,90 @@ control my_ingress(inout headers_t hdr,
         standard_metadata.egress_spec = port;
     }
 
-    action dnat_action(IPv4Address real_ip, bit<16> real_port, bit<9> port) {
-        meta.translated_ip = real_ip;
-        meta.translated_port = real_port;
-        meta.nat_type = 1; // Flag for DNAT
-        standard_metadata.egress_spec = port;
+    // --- IP-ONLY NAT ACTIONS (For ICMP/UDP and ARP) ---
+    action dnat_ip_action(IPv4Address real_ip) {
+        if (hdr.ipv4.isValid()) { hdr.ipv4.dst_addr = real_ip; }
+        if (hdr.arp.isValid())  { hdr.arp.proto_dst_addr = real_ip; }
     }
 
-    action snat_and_route(IPv4Address virtual_ip, bit<16> virtual_port, bit<9> port) {
-        meta.translated_ip = virtual_ip;
-        meta.translated_port = virtual_port;
-        meta.nat_type = 2; // Flag for SNAT
-        standard_metadata.egress_spec = port;
+    action snat_ip_action(IPv4Address virtual_ip) {
+        if (hdr.ipv4.isValid()) { hdr.ipv4.src_addr = virtual_ip; }
+        if (hdr.arp.isValid())  { hdr.arp.proto_src_addr = virtual_ip; }
     }
 
+    // --- NAT ACTIONS ---
+    action dnat_tcp_action(IPv4Address real_ip, bit<16> real_port) {
+        hdr.ipv4.dst_addr = real_ip;
+        hdr.tcp.dst_port = real_port;
+    }
+
+    action snat_tcp_action(IPv4Address virtual_ip, bit<16> virtual_port) {
+        hdr.ipv4.src_addr = virtual_ip;
+        hdr.tcp.src_port = virtual_port;
+    }
+
+    // --- IP-ONLY NAT TABLES ---
+    table inbound_ip_nat {
+        key = {
+            meta.routing_dst_addr : exact;
+        }
+        actions = {
+            dnat_ip_action;
+            NoAction;
+        }
+        size = 1024;
+        default_action = NoAction;
+    }
+
+    table outbound_ip_nat {
+        key = {
+            meta.routing_src_addr : exact;
+        }
+        actions = {
+            snat_ip_action;
+            NoAction;
+        }
+        size = 1024;
+        default_action = NoAction;
+    }
+
+    // --- NAT TABLES ---
+    
+    // Inbound: Matches exactly on [Virtual IP + Virtual Port]
+    table inbound_tcp_nat {
+        key = {
+            hdr.ipv4.dst_addr : exact;
+            hdr.tcp.dst_port  : exact;
+        }
+        actions = {
+            dnat_tcp_action;
+            drop_action;
+        }
+        size = 1024;
+        default_action = drop_action;
+    }
+
+    // Outbound: Matches exactly on [Real IP + Real Port]
+    table outbound_tcp_nat {
+        key = {
+            hdr.ipv4.src_addr : exact;
+            hdr.tcp.src_port  : exact;
+        }
+        actions = {
+            snat_tcp_action;
+            drop_action;
+        }
+        size = 1024;
+        default_action = drop_action;
+    }
+
+    // Standard Routing Table (Used for ICMP/Ping, ARP, and non-MTD traffic)
     table ipv4_lpm {
         key = {
             meta.routing_dst_addr: lpm;
         }
         actions = {
             to_port_action;
-            dnat_action;
-            snat_and_route;
             drop_action;
         }
         size = 1024;
@@ -231,55 +291,53 @@ control my_ingress(inout headers_t hdr,
             
             bit<32> index = (bit<32>) hdr.ipv4.src_addr & 1023;
 
-            // Read the memory
             syn_counters.read(syn_count, index);
             last_syn_timestamps.read(last_time, index);
 
-            // RATE MEASUREMENT: Did the last SYN happen more than 1 second ago?
-            // (1,000,000 microseconds = 1 second)
             if (current_time - last_time > 1000000) {
-                // Too much time passed. Reset the counter.
                 syn_count = 1;
             } else {
-                // It happened fast! Increment the counter.
                 syn_count = syn_count + 1;
             }
 
-            // Write the new data back to memory
             syn_counters.write(index, syn_count);
             last_syn_timestamps.write(index, current_time);
 
-            // Check the threshold (e.g., 3 SYNs within 1 second)
             if (syn_count == 3) {
-                // 100 is our arbitrary "Mirror Session ID"
                 clone(CloneType.I2E, 100);
             }
         }
-        // 1. Extract the target IP address depending on the packet type
+
+        // --- Extract the target IP address for the standard routing fallback ---
         if (hdr.ipv4.isValid()) {
             meta.routing_dst_addr = hdr.ipv4.dst_addr;
+            meta.routing_src_addr = hdr.ipv4.src_addr; // Grab the source!
         } else if (hdr.arp.isValid()) {
             meta.routing_dst_addr = hdr.arp.proto_dst_addr;
+            meta.routing_src_addr = hdr.arp.proto_src_addr; // Grab the source!
         } else {
-            return; // Drop anything that isn't IPv4 or ARP
+            return;
         }
 
-        // 2. Apply the routing table using the extracted IP
+        // --- Translation ---
+        if(hdr.tcp.isValid()){
+            if (inbound_tcp_nat.apply().hit) {
+                meta.routing_dst_addr = hdr.ipv4.dst_addr; 
+            } 
+            else if (outbound_tcp_nat.apply().hit) {}
+        }else{
+            if (inbound_ip_nat.apply().hit) {
+                if(hdr.ipv4.isValid()){
+                    meta.routing_dst_addr = hdr.ipv4.dst_addr; 
+                }
+                else if(hdr.arp.isValid()){
+                    meta.routing_dst_addr = hdr.arp.proto_dst_addr; 
+                }
+            } 
+            else if (outbound_ip_nat.apply().hit) {}
+        }
+
         ipv4_lpm.apply();
-
-        // 3. Apply the Translations to BOTH IPv4 and ARP!
-        if (meta.nat_type == 1) {
-            // It's DNAT (Inbound to Server)
-            if (hdr.ipv4.isValid()) { hdr.ipv4.dst_addr = meta.translated_ip; }
-            if (hdr.arp.isValid()) { hdr.arp.proto_dst_addr = meta.translated_ip; }
-            if (hdr.tcp.isValid()) { hdr.tcp.dst_port = meta.translated_port; }
-        } 
-        else if (meta.nat_type == 2) {
-            // It's SNAT (Outbound from Server)
-            if (hdr.ipv4.isValid()) { hdr.ipv4.src_addr = meta.translated_ip; }
-            if (hdr.arp.isValid()) { hdr.arp.proto_src_addr = meta.translated_ip; }
-            if (hdr.tcp.isValid()) { hdr.tcp.src_port = meta.translated_port; }
-        }
     }
 }
 
