@@ -2,6 +2,12 @@ import socket
 import select
 import hashlib
 import builtins
+import os
+import fcntl
+import struct
+import subprocess
+import threading
+from scapy.all import IP, TCP, send, sniff, conf
 
 # Force unbuffered output for background logging
 def print(*args, **kwargs):
@@ -11,7 +17,10 @@ def print(*args, **kwargs):
 # --- CONFIG ---
 SEED = "CS6045_Secret"
 UDP_LISTEN_PORT = 9999
-IPC_PORT = 5050
+TUN_NAME = "mtd-tun0"
+
+# Get the primary physical interface (usually h3-eth0)
+PHYSICAL_IFACE = str(conf.route.route("0.0.0.0")[0])
 
 # Track the exact same state as the controller
 HOSTS = {
@@ -54,60 +63,139 @@ def apply_route_update(real_ip, seq_num):
         service["active_vport"] = vPort
         print(f"    -> Service {real_port} mapped to vPort {vPort}")
 
+# --- TUN SETUP ---
+def setup_tun():
+    TUNSETIFF = 0x400454ca
+    IFF_TUN = 0x0001
+    IFF_NO_PI = 0x1000
+    
+    print(f"[*] Creating TUN interface: {TUN_NAME}")
+    tun_fd = os.open('/dev/net/tun', os.O_RDWR)
+    ifr = struct.pack('16sH', TUN_NAME.encode('utf-8'), IFF_TUN | IFF_NO_PI)
+    fcntl.ioctl(tun_fd, TUNSETIFF, ifr)
+    
+    # Bring interface up
+    subprocess.run(["ip", "link", "set", "dev", TUN_NAME, "up"], check=True)
+    
+    # Route traffic for our protected servers into the TUN
+    for host_ip in HOSTS:
+        print(f"[*] Hijacking route for {host_ip} into {TUN_NAME}")
+        subprocess.run(["ip", "route", "add", f"{host_ip}/32", "dev", TUN_NAME], check=True)
+        
+    # Prevent the kernel from sending RSTs when it sees incoming vIP traffic
+    print(f"[*] Adding iptables drop rules for vIP subnet to prevent kernel RSTs")
+    subprocess.run(["iptables", "-A", "INPUT", "-s", "192.168.50.0/24", "-j", "DROP"], check=True)
+        
+    return tun_fd
+
+# Create a global raw socket to bypass Scapy's ARP/Layer 2 issues
+raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+# Tell the kernel we are providing the IP header
+raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+
+# --- EGRESS (Outbound to Wire) ---
+def egress_loop(tun_fd):
+    print(f"[*] Egress Thread Started: Reading from {TUN_NAME}")
+    while True:
+        try:
+            packet_bytes = os.read(tun_fd, 2048)
+            pkt = IP(packet_bytes)
+            
+            target_ip = pkt.dst
+            if target_ip in HOSTS and HOSTS[target_ip]["active_vip"]:
+                host = HOSTS[target_ip]
+                
+                if TCP in pkt and pkt[TCP].dport in host["services"]:
+                    service = host["services"][pkt[TCP].dport]
+                    
+                    if service["active_vport"]:
+                        print(f"[DEBUG] Egress: Intercepted TCP SYN to {target_ip}:{pkt[TCP].dport}")
+                        # MANGLE!
+                        pkt.dst = host["active_vip"]
+                        pkt[TCP].dport = service["active_vport"]
+                        
+                        # Force Scapy to recalculate checksums
+                        del pkt[IP].chksum
+                        del pkt[TCP].chksum
+                        
+                        # Get the raw bytes with correct checksums
+                        raw_bytes = bytes(pkt[IP])
+                        
+                        # Send out via native OS raw socket (OS handles ARP and MAC natively!)
+                        raw_sock.sendto(raw_bytes, (pkt.dst, 0))
+                        
+                        print(f"[DEBUG] Egress: Mangled and sent out to {pkt.dst}:{pkt[TCP].dport}")
+                        
+        except Exception as e:
+            print(f"[!] Egress Error: {e}")
+
+# --- INGRESS (Inbound from Wire) ---
+def handle_ingress(pkt):
+    if IP in pkt and TCP in pkt:
+        src_ip = pkt[IP].src
+        src_port = pkt[TCP].sport
+        
+        # Reverse lookup: Is this packet coming from an active vIP:vPort?
+        for real_ip, host in HOSTS.items():
+            if host["active_vip"] == src_ip:
+                for real_port, service in host["services"].items():
+                    if service["active_vport"] == src_port:
+                        print(f"[DEBUG] Ingress: Caught incoming packet from vIP {src_ip}:{src_port}")
+                        
+                        # MANGLE! (Revert back to Real IP:Port)
+                        pkt[IP].src = real_ip
+                        pkt[TCP].sport = real_port
+                        
+                        # Force Scapy to recalculate checksums
+                        del pkt[IP].chksum
+                        del pkt[TCP].chksum
+                        
+                        # Get raw bytes of Layer 3 (IP)
+                        mangled_bytes = bytes(pkt[IP])
+                        
+                        # Inject into TUN. The OS TCP stack will receive it natively.
+                        global tun_fd_global
+                        os.write(tun_fd_global, mangled_bytes)
+                        print(f"[DEBUG] Ingress: Mangled and wrote to TUN as {real_ip}:{real_port}")
+                        return
+
+def ingress_loop():
+    print(f"[*] Ingress Thread Started: Sniffing on {PHYSICAL_IFACE}")
+    sniff(iface=PHYSICAL_IFACE, prn=handle_ingress, filter="tcp", store=False)
+
 if __name__ == "__main__":
-    print("[*] Starting MTD Agent...")
+    print("[*] Starting Stateless NAT Agent...")
 
-    # Set up UDP Listener (Controller Beacons)
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind(("0.0.0.0", UDP_LISTEN_PORT))
-
-    # Set up TCP Server (Client Queries)
-    tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp_server.bind(("127.0.0.1", IPC_PORT))
-    tcp_server.listen(5)
-
-    print(f"[*] Listening for Controller Beacons on UDP {UDP_LISTEN_PORT}")
-    print(f"[*] Serving Client App on TCP {IPC_PORT}")
+    # Set up TUN
+    tun_fd_global = setup_tun()
 
     # Initialize Patient Zero
     for host_ip in HOSTS:
         apply_route_update(host_ip, 0)
 
-    inputs = [udp_sock, tcp_server]
+    # Start Worker Threads
+    egress_thread = threading.Thread(target=egress_loop, args=(tun_fd_global,), daemon=True)
+    ingress_thread = threading.Thread(target=ingress_loop, daemon=True)
+    
+    egress_thread.start()
+    ingress_thread.start()
+
+    # Main Thread: Listen for UDP Beacons
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.bind(("0.0.0.0", UDP_LISTEN_PORT))
+
+    print(f"[*] Listening for Controller Beacons on UDP {UDP_LISTEN_PORT}")
 
     while True:
-        readable, _, _ = select.select(inputs, [], [])
-        
-        for s in readable:
-            if s is udp_sock:
-                data, _ = udp_sock.recvfrom(1024)
-                try:
-                    message = data.decode('utf-8', errors='ignore').strip('\x00')
-                    # Expecting: SERVER_DB:10.0.2.5:SEQ_X
-                    if message.startswith("SERVER_DB:"):
-                        parts = message.split(":")
-                        if len(parts) >= 3 and parts[2].startswith("SEQ_"):
-                            real_ip = parts[1]
-                            seq = int(parts[2].replace("SEQ_", ""))
-                            apply_route_update(real_ip, seq)
-                except Exception as e:
-                    print(f"[!] Error parsing beacon: {e} | Raw data: {data}")
-                    
-            elif s is tcp_server:
-                client_sock, _ = tcp_server.accept()
-                try:
-                    # For now, to keep the existing h3_client.py working, we will always
-                    # just serve the route for 10.0.2.5:80.
-                    # Once we do the NFQUEUE transparent proxy, this TCP IPC server will be removed anyway.
-                    host = HOSTS.get("10.0.2.5")
-                    if host and host["active_vip"] and host["services"][80]["active_vport"]:
-                        response = f"{host['active_vip']}:{host['services'][80]['active_vport']}"
-                    else:
-                        response = "WAIT"
-                    client_sock.sendall(response.encode('utf-8'))
-                except Exception as e:
-                    print(f"[!] IPC Error: {e}")
-                finally:
-                    client_sock.close()
+        data, _ = udp_sock.recvfrom(1024)
+        try:
+            message = data.decode('utf-8', errors='ignore').strip('\x00')
+            if message.startswith("SERVER_DB:"):
+                parts = message.split(":")
+                if len(parts) >= 3 and parts[2].startswith("SEQ_"):
+                    real_ip = parts[1]
+                    seq = int(parts[2].replace("SEQ_", ""))
+                    apply_route_update(real_ip, seq)
+        except Exception as e:
+            print(f"[!] Error parsing beacon: {e}")

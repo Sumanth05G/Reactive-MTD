@@ -10,7 +10,7 @@ When a volumetric attack is detected by the P4 switch, the Python controller upd
 - BMv2 (`simple_switch_CLI`)
 - Python 3.x
 - Scapy (requires `sudo` privileges)
-
+- Python standard libraries: `socket`, `select`, `hashlib`, `fcntl`, `struct`, `os` (no external `pip` installations needed besides Scapy!)
 ## Running and Testing
 
 **Note:** The SDN controller requires root access to sniff and inject packets. Clients and servers run inside isolated Mininet namespaces.

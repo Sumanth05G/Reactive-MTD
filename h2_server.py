@@ -1,38 +1,43 @@
 import socket
+import time
 
-def run_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(('0.0.0.0', 80))
-    server_socket.listen(5)
-
-    print("[*] Server active. Listening on TCP port 80...")
-
-    while True:
-        print("\n[*] Waiting for a client connection...")
-        try:
-            conn, addr = server_socket.accept()
-            print(f"[+] Client connected from {addr}!")
-
-            # THE FIX: The Ghost Connection killer.
-            # If the server hears nothing for 3 seconds, it assumes the MTD hopped.
-            conn.settimeout(3.0)
-
-            while True:
-                data = conn.recv(1024)
-                if not data:
-                    print("[-] Client disconnected gracefully.")
-                    break
-                print(f"[DATA] {data.decode('utf-8').strip()}")
-
-        except socket.timeout:
-            print("[!] Timeout: No heartbeat received. Assuming MTD hopped and dropped the connection.")
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            print("[!] Connection abruptly broken by network.")
-        finally:
-            # Clean up the dead socket and loop back to accept the new connection
-            if 'conn' in locals():
-                conn.close()
+HOST = "10.0.2.5"
+PORT = 80
 
 if __name__ == "__main__":
-    run_server()
+    print(f"[*] Starting Vanilla TCP Server on {HOST}:{PORT}...")
+    
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+        
+        print("[*] Waiting for connection...")
+        conn, addr = s.accept()
+        
+        with conn:
+            print(f"[+] Connection accepted from {addr}")
+            counter = 1
+            
+            while True:
+                try:
+                    # Server sends first
+                    message = f"{counter}"
+                    conn.sendall(message.encode('utf-8'))
+                    print(f"[Server] Sent: {counter}")
+                    
+                    # Receive response
+                    data = conn.recv(1024)
+                    if not data:
+                        print("[-] Connection closed by client.")
+                        break
+                        
+                    received_val = int(data.decode('utf-8').strip())
+                    print(f"[Server] Received: {received_val}")
+                    
+                    counter = received_val + 1
+                    time.sleep(1) # Slow down so user can read it
+                    
+                except Exception as e:
+                    print(f"[!] Server Error: {e}")
+                    break
