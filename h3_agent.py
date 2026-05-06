@@ -1,28 +1,58 @@
 import socket
 import select
 import hashlib
+import builtins
+
+# Force unbuffered output for background logging
+def print(*args, **kwargs):
+    kwargs['flush'] = True
+    builtins.print(*args, **kwargs)
 
 # --- CONFIG ---
-REAL_IP = "10.0.2.5"
 SEED = "CS6045_Secret"
 UDP_LISTEN_PORT = 9999
 IPC_PORT = 5050
 
-current_vip = None
-current_vport = None
+# Track the exact same state as the controller
+HOSTS = {
+    "10.0.2.5": {
+        "active_vip": None,
+        "port_offset": 0,
+        "services": {
+            80: {"active_vport": None},
+            8080: {"active_vport": None}
+        }
+    }
+}
 
-def calculate_virtual_ip(seq_num):
-    raw_string = f"{REAL_IP}:{SEED}:{seq_num}"
+def calculate_virtual_ip(real_ip, seq_num):
+    raw_string = f"{real_ip}:{SEED}:{seq_num}"
     hash_object = hashlib.sha256(raw_string.encode('utf-8'))
     hash_int = int(hash_object.hexdigest(), 16)
     v_host = (hash_int % 253) + 1
     return f"192.168.50.{v_host}"
 
-def calculate_virtual_port(seq_num):
-    raw_string = f"PORT:{REAL_IP}:{SEED}:{seq_num}"
+def calculate_port_offset(real_ip, seq_num):
+    raw_string = f"PORT:{real_ip}:{SEED}:{seq_num}"
     hash_object = hashlib.sha256(raw_string.encode('utf-8'))
     hash_int = int(hash_object.hexdigest(), 16)
-    return 10000 + (hash_int % 50000)
+    return hash_int % 50000
+
+def apply_route_update(real_ip, seq_num):
+    if real_ip not in HOSTS:
+        return
+        
+    host = HOSTS[real_ip]
+    host["active_vip"] = calculate_virtual_ip(real_ip, seq_num)
+    host["port_offset"] = calculate_port_offset(real_ip, seq_num)
+    
+    print(f"\n[!] Routing Update for {real_ip} (Seq {seq_num})")
+    print(f"    -> New vIP: {host['active_vip']}")
+    
+    for real_port, service in host["services"].items():
+        vPort = 10000 + ((real_port + host["port_offset"]) % 50000)
+        service["active_vport"] = vPort
+        print(f"    -> Service {real_port} mapped to vPort {vPort}")
 
 if __name__ == "__main__":
     print("[*] Starting MTD Agent...")
@@ -42,9 +72,8 @@ if __name__ == "__main__":
     print(f"[*] Serving Client App on TCP {IPC_PORT}")
 
     # Initialize Patient Zero
-    current_vip = calculate_virtual_ip(0)
-    current_vport = calculate_virtual_port(0)
-    print(f"[*] Initial target locked: {current_vip}:{current_vport}")
+    for host_ip in HOSTS:
+        apply_route_update(host_ip, 0)
 
     inputs = [udp_sock, tcp_server]
 
@@ -52,30 +81,29 @@ if __name__ == "__main__":
         readable, _, _ = select.select(inputs, [], [])
         
         for s in readable:
-            # --- HANDLE INCOMING UDP FROM CONTROLLER ---
             if s is udp_sock:
                 data, _ = udp_sock.recvfrom(1024)
                 try:
-                    # Strip null bytes in case Scapy padded the raw payload
                     message = data.decode('utf-8', errors='ignore').strip('\x00')
-                    
-                    if "SEQ_" in message:
-                        # USING YOUR PROVEN PARSING LOGIC
-                        seq = int(message.split("SEQ_")[1])
-                        
-                        current_vip = calculate_virtual_ip(seq)
-                        current_vport = calculate_virtual_port(seq)
-                        
-                        print(f"[!] Routing Update Received! Network mutated to: {current_vip}:{current_vport} (Seq {seq})")
+                    # Expecting: SERVER_DB:10.0.2.5:SEQ_X
+                    if message.startswith("SERVER_DB:"):
+                        parts = message.split(":")
+                        if len(parts) >= 3 and parts[2].startswith("SEQ_"):
+                            real_ip = parts[1]
+                            seq = int(parts[2].replace("SEQ_", ""))
+                            apply_route_update(real_ip, seq)
                 except Exception as e:
                     print(f"[!] Error parsing beacon: {e} | Raw data: {data}")
                     
-            # --- HANDLE INCOMING TCP FROM CLIENT ---
             elif s is tcp_server:
                 client_sock, _ = tcp_server.accept()
                 try:
-                    if current_vip and current_vport:
-                        response = f"{current_vip}:{current_vport}"
+                    # For now, to keep the existing h3_client.py working, we will always
+                    # just serve the route for 10.0.2.5:80.
+                    # Once we do the NFQUEUE transparent proxy, this TCP IPC server will be removed anyway.
+                    host = HOSTS.get("10.0.2.5")
+                    if host and host["active_vip"] and host["services"][80]["active_vport"]:
+                        response = f"{host['active_vip']}:{host['services'][80]['active_vport']}"
                     else:
                         response = "WAIT"
                     client_sock.sendall(response.encode('utf-8'))
