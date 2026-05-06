@@ -2,7 +2,7 @@ import socket
 import time
 import hashlib
 import subprocess
-from scapy.all import sniff, IP, TCP, Ether, UDP, sendp
+from scapy.all import sniff, IP, TCP, Ether, UDP, sendp, Raw
 
 # --- MTD VARIABLES ---
 REAL_IP = "10.0.2.5"
@@ -112,8 +112,8 @@ def mutate_server(sequence_number):
     # 2. Alert the Client via Direct Packet Injection
     message = f"SERVER_DB:SEQ_{sequence_number}"
 
-    # Craft a raw packet targeting h3's namespace
-    beacon_pkt = Ether(dst="00:04:00:00:00:03") / IP(dst=CLIENT_IP) / UDP(dport=CLIENT_UDP_PORT) / message
+    # Use Broadcast MAC so the Linux kernel accepts it regardless of h3's actual MAC
+    beacon_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=CLIENT_IP) / UDP(dport=CLIENT_UDP_PORT) / Raw(load=message)
 
     # Inject it directly into the switch port facing h3 (s3-eth1)
     sendp(beacon_pkt, iface="s3-eth1", verbose=False)
