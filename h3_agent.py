@@ -7,7 +7,9 @@ import fcntl
 import struct
 import subprocess
 import threading
+import base64
 from scapy.all import IP, TCP, send, sniff, conf
+from cryptography.fernet import Fernet, InvalidToken
 
 # Force unbuffered output for background logging
 def print(*args, **kwargs):
@@ -18,6 +20,15 @@ def print(*args, **kwargs):
 SEED = "CS6045_Secret"
 UDP_LISTEN_PORT = 9999
 TUN_NAME = "mtd-tun0"
+
+# --- CRYPTOGRAPHY SETUP ---
+# Derive a valid 32-byte Fernet key from the plain text SEED
+key_hash = hashlib.sha256(SEED.encode('utf-8')).digest()
+FERNET_KEY = base64.urlsafe_b64encode(key_hash)
+cipher_suite = Fernet(FERNET_KEY)
+
+# Track highest seen sequence per host to block Replay Attacks
+seen_seqs = {}
 
 # Get the primary physical interface (usually h3-eth0)
 PHYSICAL_IFACE = str(conf.route.route("0.0.0.0")[0])
@@ -109,7 +120,6 @@ def egress_loop(tun_fd):
                     service = host["services"][pkt[TCP].dport]
                     
                     if service["active_vport"]:
-                        print(f"[DEBUG] Egress: Intercepted TCP SYN to {target_ip}:{pkt[TCP].dport}")
                         # MANGLE!
                         pkt.dst = host["active_vip"]
                         pkt[TCP].dport = service["active_vport"]
@@ -121,10 +131,8 @@ def egress_loop(tun_fd):
                         # Get the raw bytes with correct checksums
                         raw_bytes = bytes(pkt[IP])
                         
-                        # Send out via native OS raw socket (OS handles ARP and MAC natively!)
+                        # Send out via native OS raw socket
                         raw_sock.sendto(raw_bytes, (pkt.dst, 0))
-                        
-                        print(f"[DEBUG] Egress: Mangled and sent out to {pkt.dst}:{pkt[TCP].dport}")
                         
         except Exception as e:
             print(f"[!] Egress Error: {e}")
@@ -140,7 +148,6 @@ def handle_ingress(pkt):
             if host["active_vip"] == src_ip:
                 for real_port, service in host["services"].items():
                     if service["active_vport"] == src_port:
-                        print(f"[DEBUG] Ingress: Caught incoming packet from vIP {src_ip}:{src_port}")
                         
                         # MANGLE! (Revert back to Real IP:Port)
                         pkt[IP].src = real_ip
@@ -153,10 +160,9 @@ def handle_ingress(pkt):
                         # Get raw bytes of Layer 3 (IP)
                         mangled_bytes = bytes(pkt[IP])
                         
-                        # Inject into TUN. The OS TCP stack will receive it natively.
+                        # Inject into TUN
                         global tun_fd_global
                         os.write(tun_fd_global, mangled_bytes)
-                        print(f"[DEBUG] Ingress: Mangled and wrote to TUN as {real_ip}:{real_port}")
                         return
 
 def ingress_loop():
@@ -172,6 +178,7 @@ if __name__ == "__main__":
     # Initialize Patient Zero
     for host_ip in HOSTS:
         apply_route_update(host_ip, 0)
+        seen_seqs[host_ip] = 0
 
     # Start Worker Threads
     egress_thread = threading.Thread(target=egress_loop, args=(tun_fd_global,), daemon=True)
@@ -185,17 +192,35 @@ if __name__ == "__main__":
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_sock.bind(("0.0.0.0", UDP_LISTEN_PORT))
 
-    print(f"[*] Listening for Controller Beacons on UDP {UDP_LISTEN_PORT}")
+    print(f"[*] Listening for SECURE Controller Beacons on UDP {UDP_LISTEN_PORT}")
 
     while True:
-        data, _ = udp_sock.recvfrom(1024)
+        data, _ = udp_sock.recvfrom(2048) # Increased buffer for encrypted payload
         try:
-            message = data.decode('utf-8', errors='ignore').strip('\x00')
+            # 1. Decrypt and Verify Hash (Fernet handles this instantly)
+            decrypted_bytes = cipher_suite.decrypt(data)
+            message = decrypted_bytes.decode('utf-8')
+            
             if message.startswith("SERVER_DB:"):
                 parts = message.split(":")
                 if len(parts) >= 3 and parts[2].startswith("SEQ_"):
                     real_ip = parts[1]
                     seq = int(parts[2].replace("SEQ_", ""))
+                    
+                    # 2. STRICT ANTI-REPLAY CHECK
+                    if real_ip not in seen_seqs:
+                        seen_seqs[real_ip] = -1
+                        
+                    if seq <= seen_seqs[real_ip]:
+                        print(f"[!] REPLAY ATTACK BLOCKED! Received old sequence {seq} for {real_ip}. Dropping.")
+                        continue
+                        
+                    # 3. Update network state
+                    seen_seqs[real_ip] = seq
                     apply_route_update(real_ip, seq)
+                    
+        except InvalidToken:
+            # Triggers if the attacker tries to guess the key or modify a single byte of the packet
+            print("[!] SPOOFING DETECTED: Invalid cryptographic signature. Dropping packet.")
         except Exception as e:
-            print(f"[!] Error parsing beacon: {e}")
+            print(f"[!] General error parsing beacon: {e}")

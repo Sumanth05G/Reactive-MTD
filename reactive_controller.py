@@ -3,12 +3,20 @@ import time
 import hashlib
 import subprocess
 import re
+import base64
 from scapy.all import sniff, IP, TCP, Ether, UDP, sendp, Raw
+from cryptography.fernet import Fernet
 
 # --- MTD VARIABLES ---
 SEED = "CS6045_Secret"
 CLIENT_UDP_PORT = 9999
 SNIFF_IFACE = "s2-eth3"  # The dedicated hardware mirror port
+
+# --- CRYPTOGRAPHY SETUP ---
+# Derive a valid 32-byte Fernet key from the plain text SEED
+key_hash = hashlib.sha256(SEED.encode('utf-8')).digest()
+FERNET_KEY = base64.urlsafe_b64encode(key_hash)
+cipher_suite = Fernet(FERNET_KEY)
 
 LEGITIMATE_CLIENTS = [
     {"ip": "10.0.3.10", "iface": "s3-eth1"}
@@ -137,7 +145,6 @@ def mutate_server(host_ip):
         print(f"[*] Deleted old P4 NAT rules for host {host_ip}")
 
     # 3. Add New Rules
-    # We must push them in a predictable order to capture the handles correctly.
     add_cmds = ""
     add_cmds += f"table_add inbound_ip_nat dnat_ip_action {vIP} => {host_ip}\n"
     add_cmds += f"table_add outbound_ip_nat snat_ip_action {host_ip} => {vIP}\n"
@@ -164,13 +171,21 @@ def mutate_server(host_ip):
     else:
         print(f"[!] Warning: Expected {2 + (2 * len(services_list))} handles, got {len(handles)}")
 
-    # 4. Alert the Clients via Direct Packet Injection
-    message = f"SERVER_DB:{host_ip}:SEQ_{host['seq']}"
+    # 4. Alert the Clients via Encrypted Packet Injection
+    plaintext_message = f"SERVER_DB:{host_ip}:SEQ_{host['seq']}"
+    
+    # Encrypt and hash the payload
+    encrypted_payload = cipher_suite.encrypt(plaintext_message.encode('utf-8'))
 
     for client in LEGITIMATE_CLIENTS:
-        beacon_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=client["ip"]) / UDP(dport=CLIENT_UDP_PORT) / Raw(load=message)
-        sendp(beacon_pkt, iface=client["iface"], verbose=False)
-        print(f"[*] Beacon ({message}) injected into {client['iface']} towards {client['ip']}.")
+        beacon_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=client["ip"]) / UDP(dport=CLIENT_UDP_PORT) / Raw(load=encrypted_payload)
+        
+        # Inject the encrypted payload 3 times to ensure delivery across the bridge
+        for _ in range(3):
+            sendp(beacon_pkt, iface=client["iface"], verbose=False)
+            time.sleep(0.05)
+            
+        print(f"[*] Encrypted Beacon injected into {client['iface']} towards {client['ip']}.")
 
 def handle_alert(packet):
     """Callback triggered by Scapy when a cloned packet hits s2-eth3"""
@@ -188,7 +203,6 @@ def handle_alert(packet):
                 break
 
         if not matched_host_ip:
-            # Not targeting an active vIP/vPort that we track
             return
 
         host = HOSTS[matched_host_ip]
