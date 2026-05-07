@@ -1,11 +1,26 @@
 import socket
 import time
-
-HOST = "10.0.2.5"
-PORT = 80
+import argparse
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 if __name__ == "__main__":
-    print(f"[*] Starting Vanilla TCP Server on {HOST}:{PORT}...")
+    parser = argparse.ArgumentParser(description="Vanilla TCP Ping-Pong Server")
+    parser.add_argument("--port", type=int, default=80, help="Port to bind to (default: 80)")
+    args = parser.parse_args()
+
+    HOST = "0.0.0.0"
+    PORT = args.port
+    local_ip = get_local_ip()
+
+    print(f"[*] Starting Vanilla TCP Server on {local_ip}:{PORT} (binding to {HOST})...")
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

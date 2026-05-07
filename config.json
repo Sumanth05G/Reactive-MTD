@@ -1,0 +1,72 @@
+{
+  "fabric_switch": {
+    "name": "s0",
+    "thrift_port": 10101
+  },
+  "edge_switches": [
+    {
+      "name": "s1",
+      "thrift_port": 9090,
+      "is_mtd": false,
+      "fabric_port": 1,
+      "hosts": [
+        {
+          "name": "h_1_1",
+          "ip": "10.0.1.66",
+          "mac": "00:04:00:00:00:01",
+          "switch_port": 3,
+          "type": "attacker"
+        }
+      ]
+    },
+    {
+      "name": "s2",
+      "thrift_port": 9091,
+      "is_mtd": true,
+      "vip_subnet": "192.168.50.0/24",
+      "fabric_port": 1,
+      "sniff_port": 2,
+      "hosts": [
+        {
+          "name": "h_2_1",
+          "ip": "10.0.2.5",
+          "mac": "00:04:00:00:00:02",
+          "switch_port": 3,
+          "type": "server",
+          "services": [80, 8080]
+        }
+      ]
+    },
+    {
+      "name": "s3",
+      "thrift_port": 9092,
+      "is_mtd": false,
+      "fabric_port": 1,
+      "hosts": [
+        {
+          "name": "h_3_1",
+          "ip": "10.0.3.10",
+          "mac": "00:04:00:00:00:03",
+          "switch_port": 3,
+          "type": "legitimate_client",
+          "agent_script": "legit_agent.py"
+        }
+      ]
+    },
+    {
+      "name": "s4",
+      "thrift_port": 9093,
+      "is_mtd": false,
+      "fabric_port": 1,
+      "hosts": [
+        {
+          "name": "h_4_1",
+          "ip": "10.0.4.20",
+          "mac": "00:04:00:00:00:04",
+          "switch_port": 3,
+          "type": "server"
+        }
+      ]
+    }
+  ]
+}

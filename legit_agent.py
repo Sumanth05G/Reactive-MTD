@@ -8,6 +8,7 @@ import struct
 import subprocess
 import threading
 import base64
+import json
 from scapy.all import IP, TCP, send, sniff, conf
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -33,17 +34,25 @@ seen_seqs = {}
 # Get the primary physical interface (usually h3-eth0)
 PHYSICAL_IFACE = str(conf.route.route("0.0.0.0")[0])
 
-# Track the exact same state as the controller
-HOSTS = {
-    "10.0.2.5": {
-        "active_vip": None,
-        "port_offset": 0,
-        "services": {
-            80: {"active_vport": None},
-            8080: {"active_vport": None}
-        }
-    }
-}
+# Track the exact same state as the controller (populated dynamically)
+HOSTS = {}
+VIP_SUBNETS = []
+
+def load_config():
+    with open("config.json", "r") as f:
+        config = json.load(f)
+        
+    for edge in config.get("edge_switches", []):
+        if edge.get("is_mtd"):
+            VIP_SUBNETS.append(edge["vip_subnet"])
+            for host in edge.get("hosts", []):
+                if host.get("type") == "server":
+                    HOSTS[host["ip"]] = {
+                        "active_vip": None,
+                        "port_offset": 0,
+                        "services": {port: {"active_vport": None} for port in host.get("services", [])}
+                    }
+                    seen_seqs[host["ip"]] = 0
 
 def calculate_virtual_ip(real_ip, seq_num):
     raw_string = f"{real_ip}:{SEED}:{seq_num}"
@@ -94,8 +103,9 @@ def setup_tun():
         subprocess.run(["ip", "route", "add", f"{host_ip}/32", "dev", TUN_NAME], check=True)
         
     # Prevent the kernel from sending RSTs when it sees incoming vIP traffic
-    print(f"[*] Adding iptables drop rules for vIP subnet to prevent kernel RSTs")
-    subprocess.run(["iptables", "-A", "INPUT", "-s", "192.168.50.0/24", "-j", "DROP"], check=True)
+    for subnet in VIP_SUBNETS:
+        print(f"[*] Adding iptables drop rules for vIP subnet {subnet} to prevent kernel RSTs")
+        subprocess.run(["iptables", "-A", "INPUT", "-s", subnet, "-j", "DROP"], check=True)
         
     return tun_fd
 
@@ -172,13 +182,15 @@ def ingress_loop():
 if __name__ == "__main__":
     print("[*] Starting Stateless NAT Agent...")
 
+    # Load Dynamic Config
+    load_config()
+
     # Set up TUN
     tun_fd_global = setup_tun()
 
     # Initialize Patient Zero
     for host_ip in HOSTS:
         apply_route_update(host_ip, 0)
-        seen_seqs[host_ip] = 0
 
     # Start Worker Threads
     egress_thread = threading.Thread(target=egress_loop, args=(tun_fd_global,), daemon=True)
