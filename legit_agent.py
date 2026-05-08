@@ -9,7 +9,7 @@ import subprocess
 import threading
 import base64
 import json
-from scapy.all import IP, TCP, send, sniff, conf
+from scapy.all import IP, TCP, ICMP, send, sniff, conf
 from cryptography.fernet import Fernet, InvalidToken
 
 # Force unbuffered output for background logging
@@ -109,7 +109,7 @@ def setup_tun():
     # Prevent the kernel from sending RSTs when it sees incoming vIP traffic
     for subnet in VIP_SUBNETS:
         print(f"[*] Adding iptables drop rules for vIP subnet {subnet} to prevent kernel RSTs")
-        subprocess.run(["iptables", "-A", "INPUT", "-s", subnet, "-j", "DROP"], check=True)
+        subprocess.run(["iptables", "-A", "INPUT", "-s", subnet, "-p" "tcp","-j", "DROP"], check=True)
         
     return tun_fd
 
@@ -147,41 +147,47 @@ def egress_loop(tun_fd):
                         
                         # Send out via native OS raw socket
                         raw_sock.sendto(raw_bytes, (pkt.dst, 0))
+                elif ICMP in pkt:
+                    # Rewrite dst to VIP for ICMP so the switch's
+                    # inbound_ip_nat handles the translation correctly
+                    pkt.dst = host["active_vip"]
+                    del pkt[IP].chksum
+                    raw_sock.sendto(bytes(pkt[IP]), (pkt.dst, 0))
                         
         except Exception as e:
             print(f"[!] Egress Error: {e}")
 
 # --- INGRESS (Inbound from Wire) ---
 def handle_ingress(pkt):
-    if IP in pkt and TCP in pkt:
-        src_ip = pkt[IP].src
-        src_port = pkt[TCP].sport
-        
-        # Reverse lookup: Is this packet coming from an active vIP:vPort?
-        for real_ip, host in HOSTS.items():
-            if host["active_vip"] == src_ip:
+    if not IP in pkt:
+        return
+
+    src_ip = pkt[IP].src
+
+    # Reverse lookup: Is this packet coming from an active vIP?
+    for real_ip, host in HOSTS.items():
+        if host["active_vip"] == src_ip:
+            # Rewrite src VIP -> real IP for all protocols
+            pkt[IP].src = real_ip
+            del pkt[IP].chksum
+
+            if TCP in pkt:
+                src_port = pkt[TCP].sport
+                # Also fix TCP port if it matches a known vPort
                 for real_port, service in host["services"].items():
                     if service["active_vport"] == src_port:
-                        
-                        # MANGLE! (Revert back to Real IP:Port)
-                        pkt[IP].src = real_ip
                         pkt[TCP].sport = real_port
-                        
-                        # Force Scapy to recalculate checksums
-                        del pkt[IP].chksum
                         del pkt[TCP].chksum
-                        
-                        # Get raw bytes of Layer 3 (IP)
-                        mangled_bytes = bytes(pkt[IP])
-                        
-                        # Inject into TUN
-                        global tun_fd_global
-                        os.write(tun_fd_global, mangled_bytes)
-                        return
+                        break
+
+            # Inject mangled packet into TUN
+            global tun_fd_global
+            os.write(tun_fd_global, bytes(pkt[IP]))
+            return
 
 def ingress_loop():
     print(f"[*] Ingress Thread Started: Sniffing on {PHYSICAL_IFACE}")
-    sniff(iface=PHYSICAL_IFACE, prn=handle_ingress, filter="tcp", store=False)
+    sniff(iface=PHYSICAL_IFACE, prn=handle_ingress, filter="tcp or icmp", store=False)
 
 if __name__ == "__main__":
     print("[*] Starting Stateless NAT Agent...")
