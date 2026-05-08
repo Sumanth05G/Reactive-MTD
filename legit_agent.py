@@ -153,6 +153,9 @@ def egress_loop(tun_fd):
                     pkt.dst = host["active_vip"]
                     del pkt[IP].chksum
                     raw_sock.sendto(bytes(pkt[IP]), (pkt.dst, 0))
+                else:
+                    # NEW: Forward non-MTD traffic exactly as it is
+                    raw_sock.sendto(packet_bytes, (target_ip, 0))
                         
         except Exception as e:
             print(f"[!] Egress Error: {e}")

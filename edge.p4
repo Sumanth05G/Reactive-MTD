@@ -303,7 +303,7 @@ control my_ingress(inout headers_t hdr,
             syn_counters.write(index, syn_count);
             last_syn_timestamps.write(index, current_time);
 
-            if (syn_count == 3) {
+            if (syn_count == 50) {
                 clone(CloneType.I2E, 100);
             }
         }
