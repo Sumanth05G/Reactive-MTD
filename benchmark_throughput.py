@@ -1,12 +1,26 @@
 import subprocess
 import json
 import time
-import threading
 import socket
 import os
+import signal
+import threading  # Added missing threading import
 
 stop_cpu_monitor = False
 cpu_samples = []
+
+def manage_agent(action):
+    """Handles stopping and starting the legit_agent.py to ensure pure baselines."""
+    if action == "stop":
+        print("[*] Terminating background legit_agent.py for pure baseline test...")
+        os.system("pkill -f legit_agent.py")
+        time.sleep(1) # Give OS time to clean up sockets/interfaces
+    elif action == "start":
+        print("[*] Booting legit_agent.py for MTD test...")
+        # Start in background, discard output to keep terminal clean
+        subprocess.Popen(["python3", "legit_agent.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("[*] Waiting 3 seconds for TUN interface and routing tables to initialize...")
+        time.sleep(3)
 
 def get_agent_pid():
     """Finds the PID of the legit_agent.py running in the background."""
@@ -42,102 +56,94 @@ def monitor_cpu(pid):
         if curr_ticks is not None and prev_ticks is not None:
             delta_ticks = curr_ticks - prev_ticks
             delta_sec = curr_time - prev_time
-            if delta_sec > 0:
-                cpu_usage = (delta_ticks / ticks_per_sec) / delta_sec * 100.0
-                cpu_samples.append(cpu_usage)
-                
+            # Calculate CPU percentage
+            cpu_usage = 100.0 * (delta_ticks / ticks_per_sec) / delta_sec
+            cpu_samples.append(cpu_usage)
+            
         prev_ticks = curr_ticks
         prev_time = curr_time
 
-def measure_tcp_latency(target_ip, port, description, count=15):
-    """Measures the true Application-Layer TCP 3-way handshake latency."""
-    print(f"\n[*] Measuring TCP Handshake Latency ({description}) to {target_ip}:{port}...")
+def measure_tcp_latency(target_ip, port, label):
+    print(f"[*] Measuring TCP Handshake Latency ({label}) to {target_ip}:{port}...")
     latencies = []
     
-    for _ in range(count):
+    for _ in range(5):
         try:
             start_time = time.time()
-            # Establish a real TCP connection
-            sock = socket.create_connection((target_ip, port), timeout=2.0)
-            end_time = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect((target_ip, port))
             sock.close()
-            
-            rtt_ms = (end_time - start_time) * 1000.0
-            latencies.append(rtt_ms)
-            time.sleep(0.1) # Small buffer between connections
+            end_time = time.time()
+            latencies.append((end_time - start_time) * 1000) # Convert to ms
+            time.sleep(0.1)
         except Exception as e:
-            pass # Ignore dropped packets/timeouts in calculation
+            print(f"  [!] Connection failed: {e}")
             
-    if not latencies:
-        print(f"[!] All connection attempts to {target_ip}:{port} timed out.")
-        return None
-        
-    avg_rtt = sum(latencies) / len(latencies)
-    print(f"[+] {description} Latency: {avg_rtt:.2f} ms")
-    return avg_rtt
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        print(f"  [+] {label} Latency: {avg_latency:.2f} ms")
+        return avg_latency
+    return None
 
-def run_iperf(target_ip, port, description, duration=10, monitor_pid=None):
-    """Runs iperf3 throughput test, tracking instantaneous CPU usage."""
-    global stop_cpu_monitor, cpu_samples
-    print(f"[*] Starting {description} Throughput Test towards {target_ip}:{port} for {duration}s...")
+def run_iperf(target_ip, port, label, duration=10, monitor_pid=None):
+    print(f"\n[*] Running iperf3 Throughput Test ({label}) to {target_ip}:{port} for {duration}s...")
     
+    global stop_cpu_monitor
     cpu_thread = None
+    
     if monitor_pid:
         stop_cpu_monitor = False
         cpu_thread = threading.Thread(target=monitor_cpu, args=(monitor_pid,))
         cpu_thread.start()
 
-    cmd = ["iperf3", "-c", target_ip, "-p", str(port), "-t", str(duration), "--json"]
+    cmd = ["iperf3", "-c", target_ip, "-p", str(port), "-t", str(duration), "-J"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     
+    if monitor_pid:
+        stop_cpu_monitor = True
+        cpu_thread.join()
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if monitor_pid and cpu_thread:
-            stop_cpu_monitor = True
-            cpu_thread.join()
-            
-        if result.returncode != 0:
-            print(f"[!] iperf3 error:\n{result.stderr}")
-            return None, 0.0
-            
         data = json.loads(result.stdout)
-        mbps = data['end']['sum_received']['bits_per_second'] / 1_000_000
-        print(f"[+] {description} Throughput: {mbps:.2f} Mbps")
+        bps = data['end']['sum_received']['bits_per_second']
+        mbps = bps / 1_000_000
+        print(f"  [+] {label} Throughput: {mbps:.2f} Mbps")
         
-        avg_cpu = sum(cpu_samples) / len(cpu_samples) if cpu_samples else 0.0
+        peak_cpu = max(cpu_samples) if cpu_samples else 0
+        avg_cpu = sum(cpu_samples)/len(cpu_samples) if cpu_samples else 0
+        
         if monitor_pid:
-            print(f"[+] legit_agent.py Peak CPU (any 0.5s window) : {max(cpu_samples):.1f}%")
-            print(f"[+] legit_agent.py Avg CPU (over 10s test)    : {avg_cpu:.1f}%")
+            print(f"  [+] Agent CPU Usage - Peak: {peak_cpu:.1f}%, Avg: {avg_cpu:.1f}%")
             
-        return mbps, avg_cpu
-        
+        return mbps, peak_cpu, avg_cpu
     except Exception as e:
-        print(f"[!] Failed to parse iperf3 output: {e}")
-        if monitor_pid and cpu_thread:
-            stop_cpu_monitor = True
-            cpu_thread.join()
-        return None, 0.0
+        print(f"  [!] Error reading iperf3 output. Did the connection drop? Details: {e}")
+        return 0, 0, 0
 
 if __name__ == "__main__":
     print("==================================================")
     print("      MTD Comprehensive Evaluation Suite")
-    print("==================================================")
-    
-    # 1. BASELINE TESTS (No MTD - Target h_4_1)
+    print("==================================================\n")
+
+    # 1. BASELINE TEST (Clean Environment)
+    manage_agent("stop")
     base_rtt = measure_tcp_latency("10.0.4.20", 80, "BASELINE")
-    base_mbps, _ = run_iperf("10.0.4.20", 80, "BASELINE", duration=10)
-    
-    time.sleep(2)
-    
-    # 2. MTD TESTS (With Cryptography & TUN overhead - Target h_2_1)
+    base_mbps, _, _ = run_iperf("10.0.4.20", 80, "BASELINE", duration=10)
+
+    # 2. MTD TEST (Agent Environment)
+    print("\n--------------------------------------------------")
+    manage_agent("start")
     agent_pid = get_agent_pid()
+    
     if not agent_pid:
-        print("\n[!] WARNING: legit_agent.py not found running in background. CPU metric will be 0.")
-    else:
-        print(f"\n[*] Found legit_agent.py running on PID: {agent_pid}")
+        print("[!] Error: Could not find legit_agent.py running. Aborting MTD test.")
+        exit(1)
+        
+    print(f"[*] Confirmed legit_agent.py running on PID: {agent_pid}")
 
     mtd_rtt = measure_tcp_latency("10.0.2.5", 80, "MTD ENABLED")
-    mtd_mbps, mtd_cpu = run_iperf("10.0.2.5", 80, "MTD ENABLED", duration=10, monitor_pid=agent_pid)
+    mtd_mbps, mtd_peak_cpu, mtd_avg_cpu = run_iperf("10.0.2.5", 80, "MTD ENABLED", duration=10, monitor_pid=agent_pid)
     
     # 3. RESULTS CALCULATION
     print("\n==================================================")
@@ -157,12 +163,9 @@ if __name__ == "__main__":
         print(f"Added Latency   : {mtd_rtt - base_rtt:.2f} ms")
         
     print("\n--- CPU BOTTLENECK ---")
-    if mtd_cpu > 0:
-        print(f"Agent Peak CPU  : {max(cpu_samples):.1f}% (Max spike in any 0.5s window)")
-        print(f"Agent Avg CPU   : {mtd_cpu:.1f}% (Average over 10s test)")
-        if mtd_cpu > 70:
-            print("Diagnosis       : Scapy packet crafting and TUN I/O in Python")
-            print("                  is capping a CPU core, creating the bottleneck.")
-    else:
-        print("Agent CPU Usage : N/A (Agent not tracked)")
-    print("==================================================")
+    if mtd_peak_cpu > 0:
+        print(f"Agent Peak CPU  : {mtd_peak_cpu:.1f}% (Max spike in any 0.5s window)")
+        print(f"Agent Avg CPU   : {mtd_avg_cpu:.1f}% (Average over 10s test)")
+        print("Diagnosis       : Scapy packet crafting and TUN I/O in Python")
+        print("                  is capping a CPU core, creating the bottleneck.")
+    print("==================================================\n")
