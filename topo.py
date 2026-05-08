@@ -54,8 +54,8 @@ class MTDTopo(Topo):
 def main():
     parser = argparse.ArgumentParser(description='MTD Custom Mininet Topology')
     parser.add_argument('--behavioral-exe', help='Path to behavioral executable', type=str, default="simple_switch")
-    parser.add_argument('--edge_json', help='Path to Edge JSON config file', type=str, required=True)
-    parser.add_argument('--fabric_json', help='Path to Fabric JSON config file', type=str, required=True)
+    parser.add_argument('--edge_json', help='Path to Edge JSON config file', type=str, default="edge.bmv2/edge.json")
+    parser.add_argument('--fabric_json', help='Path to Fabric JSON config file', type=str, default="fabric.bmv2/fabric.json")
     parser.add_argument('--config', help='Path to network configuration JSON', type=str, default="config.json")
     args = parser.parse_args()
 
