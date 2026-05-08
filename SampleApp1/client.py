@@ -1,10 +1,16 @@
 import socket
 import time
-
-SERVER_IP = "10.0.2.5"
-SERVER_PORT = 80
+import argparse
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Vanilla TCP Ping-Pong Client")
+    parser.add_argument("--ip", type=str, required=True, help="Server IP address to connect to")
+    parser.add_argument("--port", type=int, default=80, help="Server port (default: 80)")
+    args = parser.parse_args()
+
+    SERVER_IP = args.ip
+    SERVER_PORT = args.port
+
     print(f"[*] Starting Vanilla TCP Client connecting to {SERVER_IP}:{SERVER_PORT}...")
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

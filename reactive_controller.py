@@ -4,47 +4,55 @@ import hashlib
 import subprocess
 import re
 import base64
+import json
+import threading
 from scapy.all import sniff, IP, TCP, Ether, UDP, sendp, Raw
 from cryptography.fernet import Fernet
 
 # --- MTD VARIABLES ---
 SEED = "CS6045_Secret"
 CLIENT_UDP_PORT = 9999
-SNIFF_IFACE = "s2-eth3"  # The dedicated hardware mirror port
 
 # --- CRYPTOGRAPHY SETUP ---
-# Derive a valid 32-byte Fernet key from the plain text SEED
 key_hash = hashlib.sha256(SEED.encode('utf-8')).digest()
 FERNET_KEY = base64.urlsafe_b64encode(key_hash)
 cipher_suite = Fernet(FERNET_KEY)
 
-LEGITIMATE_CLIENTS = [
-    {"ip": "10.0.3.10", "iface": "s3-eth1"}
-]
+# --- DYNAMIC STATE ---
+CONFIG = {}
+HOSTS = {}
+LEGITIMATE_CLIENTS = []
+SNIFF_INTERFACES = []
 
-# --- SWITCH THRIFT PORTS ---
-S1_PORT = 9090  # Edge 1 (Attacker)
-S2_PORT = 9091  # Edge 2 (Server / MTD Target)
-S3_PORT = 9092  # Edge 3 (Client)
-S4_PORT = 10101 # Fabric
-
-# --- STATE TRACKING ---
-HOSTS = {
-    "10.0.2.5": {
-        "seq": 0,
-        "last_mutation_time": 0,
-        "active_vip": None,
-        "port_offset": 0,
-        "ip_p4_handles": {}, # {"inbound": handle, "outbound": handle}
-        "services": {
-            80: {"active_vport": None, "p4_handles": {}}, # {"inbound": handle, "outbound": handle}
-            8080: {"active_vport": None, "p4_handles": {}}
-        }
-    }
-}
+def load_config():
+    global CONFIG
+    with open("config.json", "r") as f:
+        CONFIG = json.load(f)
+        
+    for i, edge in enumerate(CONFIG.get("edge_switches", [])):
+        for host in edge.get("hosts", []):
+            if host.get("type") == "legitimate_client":
+                # The interface name the switch uses to connect to this client is <switch_name>-eth<switch_port>
+                client_iface = f"{edge['name']}-eth{host['switch_port']}"
+                LEGITIMATE_CLIENTS.append({"ip": host["ip"], "iface": client_iface})
+                
+            elif host.get("type") == "server" and edge.get("is_mtd"):
+                HOSTS[host["ip"]] = {
+                    "switch_name": edge["name"],
+                    "thrift_port": edge["thrift_port"],
+                    "seq": 0,
+                    "last_mutation_time": 0,
+                    "active_vip": None,
+                    "port_offset": 0,
+                    "ip_p4_handles": {},
+                    "services": {port: {"active_vport": None, "p4_handles": {}} for port in host.get("services", [])}
+                }
+                
+        if edge.get("is_mtd") and "sniff_port" in edge:
+            # The interface name for the dummy sniff host
+            SNIFF_INTERFACES.append(f"{edge['name']}-eth{edge['sniff_port']}")
 
 def push_p4_rules(thrift_port, rules_string):
-    """Pushes commands to the P4 switch and returns the handles of added entries"""
     try:
         result = subprocess.run(
             ["simple_switch_CLI", "--thrift-port", str(thrift_port)],
@@ -53,7 +61,6 @@ def push_p4_rules(thrift_port, rules_string):
             capture_output=True,
             check=True
         )
-        # Extract all handles using regex from simple_switch_CLI stdout
         handles = re.findall(r"Entry has been added with handle (\d+)", result.stdout)
         return [int(h) for h in handles]
     except subprocess.CalledProcessError as e:
@@ -61,43 +68,70 @@ def push_p4_rules(thrift_port, rules_string):
         return []
 
 def initialize_static_network():
-    """Sets up the non-moving parts of the network"""
-    print("[*] Initializing Static Network Routes...")
+    print("[*] Initializing Static Network Routes dynamically from config...")
+    
+    fab_thrift = CONFIG["fabric_switch"]["thrift_port"]
+    fab_cmds = ""
 
-    # S1: Route to h1, else Fabric
-    push_p4_rules(S1_PORT,
-        "table_add ipv4_lpm to_port_action 10.0.1.66/32 => 1\n"
-        "table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2\n"
-        "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
+    all_vip_subnets = []
 
-    # S2 (Server Edge): Route to h2, else Fabric. + Hardware Mirroring
-    push_p4_rules(S2_PORT,
-        "table_add ipv4_lpm to_port_action 10.0.2.5/32 => 1\n"
-        "table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2\n"
-        "mirroring_add 100 3\n")
+    for i, edge in enumerate(CONFIG.get("edge_switches", [])):
+        fabric_egress_port = i + 1
+        edge_cmds = ""
+        edge_thrift = edge["thrift_port"]
+        
+        # Route 10.0.0.0/16 to Fabric
+        edge_cmds += f"table_add ipv4_lpm to_port_action 10.0.0.0/16 => {edge['fabric_port']}\n"
+        
+        if edge.get("is_mtd"):
+            vip_subnet = edge["vip_subnet"]
+            all_vip_subnets.append(vip_subnet)
+            # Fabric switch needs to know how to reach this vIP subnet
+            fab_cmds += f"table_add ipv4_lpm to_port_action {vip_subnet} => {fabric_egress_port}\n"
+            # Hardware Mirroring
+            edge_cmds += f"mirroring_add 100 {edge['sniff_port']}\n"
+            
+        for host in edge.get("hosts", []):
+            # Edge local routing
+            edge_cmds += f"table_add ipv4_lpm to_port_action {host['ip']}/32 => {host['switch_port']}\n"
+            
+            # Fabric switch routing (assuming /24 subnets based on IP)
+            subnet = host['ip'].rsplit('.', 1)[0] + ".0/24"
+            if f"table_add ipv4_lpm to_port_action {subnet} =>" not in fab_cmds:
+                fab_cmds += f"table_add ipv4_lpm to_port_action {subnet} => {fabric_egress_port}\n"
+                
+        # Push to Edge Switch
+        push_p4_rules(edge_thrift, edge_cmds)
 
-    # S3: Route to h3, else Fabric
-    push_p4_rules(S3_PORT,
-        "table_add ipv4_lpm to_port_action 10.0.3.10/32 => 1\n"
-        "table_add ipv4_lpm to_port_action 10.0.0.0/16 => 2\n"
-        "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
+    # All edge switches must route to all known vIP subnets via the fabric
+    for edge in CONFIG.get("edge_switches", []):
+        edge_thrift = edge["thrift_port"]
+        edge_cmds = ""
+        for vip_sub in all_vip_subnets:
+            if edge.get("vip_subnet") != vip_sub:
+                edge_cmds += f"table_add ipv4_lpm to_port_action {vip_sub} => {edge['fabric_port']}\n"
+        if edge_cmds:
+            push_p4_rules(edge_thrift, edge_cmds)
 
-    # S4 (Fabric): Route to edges based on subnet
-    push_p4_rules(S4_PORT,
-        "table_add ipv4_lpm to_port_action 10.0.1.0/24 => 1\n"
-        "table_add ipv4_lpm to_port_action 10.0.3.0/24 => 3\n"
-        "table_add ipv4_lpm to_port_action 192.168.50.0/24 => 2\n")
+    # Push to Fabric Switch
+    push_p4_rules(fab_thrift, fab_cmds)
 
 def calculate_virtual_ip(real_ip, seq_num):
-    """PRNG Math to calculate the new vIP"""
     raw_string = f"{real_ip}:{SEED}:{seq_num}"
     hash_object = hashlib.sha256(raw_string.encode('utf-8'))
     hash_int = int(hash_object.hexdigest(), 16)
     v_host = (hash_int % 253) + 1
-    return f"192.168.50.{v_host}"
+    # Need to infer the subnet from the config!
+    host_switch = HOSTS[real_ip]["switch_name"]
+    vip_subnet = None
+    for edge in CONFIG["edge_switches"]:
+        if edge["name"] == host_switch:
+            vip_subnet = edge["vip_subnet"]
+            break
+    prefix = vip_subnet.rsplit('.', 1)[0]
+    return f"{prefix}.{v_host}"
 
 def calculate_port_offset(real_ip, seq_num):
-    """PRNG Math to calculate the port offset for this host sequence"""
     raw_string = f"PORT:{real_ip}:{SEED}:{seq_num}"
     hash_object = hashlib.sha256(raw_string.encode('utf-8'))
     hash_int = int(hash_object.hexdigest(), 16)
@@ -111,8 +145,8 @@ def check_vip_collision(vip, exclude_host):
 
 def mutate_server(host_ip):
     host = HOSTS[host_ip]
+    thrift_port = host["thrift_port"]
     
-    # 1. Collision-Free vIP Generation
     while True:
         vIP = calculate_virtual_ip(host_ip, host["seq"])
         if not check_vip_collision(vIP, host_ip):
@@ -129,7 +163,6 @@ def mutate_server(host_ip):
     print(f"[*] MUTATION FOR HOST {host_ip} | Seq {host['seq']}")
     print(f"[*] New vIP: {vIP} | Port Offset: {port_offset}")
 
-    # 2. Prepare Deletion Commands for Old Rules
     delete_cmds = ""
     if host["ip_p4_handles"]:
         delete_cmds += f"table_delete inbound_ip_nat {host['ip_p4_handles']['inbound']}\n"
@@ -141,10 +174,9 @@ def mutate_server(host_ip):
             delete_cmds += f"table_delete outbound_tcp_nat {service['p4_handles']['outbound']}\n"
 
     if delete_cmds:
-        push_p4_rules(S2_PORT, delete_cmds)
+        push_p4_rules(thrift_port, delete_cmds)
         print(f"[*] Deleted old P4 NAT rules for host {host_ip}")
 
-    # 3. Add New Rules
     add_cmds = ""
     add_cmds += f"table_add inbound_ip_nat dnat_ip_action {vIP} => {host_ip}\n"
     add_cmds += f"table_add outbound_ip_nat snat_ip_action {host_ip} => {vIP}\n"
@@ -158,10 +190,9 @@ def mutate_server(host_ip):
         add_cmds += f"table_add inbound_tcp_nat dnat_tcp_action {vIP} {vPort} => {host_ip} {real_port}\n"
         add_cmds += f"table_add outbound_tcp_nat snat_tcp_action {host_ip} {real_port} => {vIP} {vPort}\n"
 
-    handles = push_p4_rules(S2_PORT, add_cmds)
+    handles = push_p4_rules(thrift_port, add_cmds)
     
     if len(handles) == 2 + (2 * len(services_list)):
-        # Assign handles
         host["ip_p4_handles"] = {"inbound": handles[0], "outbound": handles[1]}
         idx = 2
         for real_port, service in services_list:
@@ -171,32 +202,23 @@ def mutate_server(host_ip):
     else:
         print(f"[!] Warning: Expected {2 + (2 * len(services_list))} handles, got {len(handles)}")
 
-    # 4. Alert the Clients via Encrypted Packet Injection
     plaintext_message = f"SERVER_DB:{host_ip}:SEQ_{host['seq']}"
-    
-    # Encrypt and hash the payload
     encrypted_payload = cipher_suite.encrypt(plaintext_message.encode('utf-8'))
 
     for client in LEGITIMATE_CLIENTS:
         beacon_pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=client["ip"]) / UDP(dport=CLIENT_UDP_PORT) / Raw(load=encrypted_payload)
-        
-        # Inject the encrypted payload 3 times to ensure delivery across the bridge
         for _ in range(3):
             sendp(beacon_pkt, iface=client["iface"], verbose=False)
             time.sleep(0.05)
-            
         print(f"[*] Encrypted Beacon injected into {client['iface']} towards {client['ip']}.")
 
 def handle_alert(packet):
-    """Callback triggered by Scapy when a cloned packet hits s2-eth3"""
     if IP in packet and TCP in packet:
         attacker_ip = packet[IP].src
         target_ip = packet[IP].dst
         target_port = packet[TCP].dport
 
-        # Find which host is being targeted
         matched_host_ip = None
-        
         for host_ip, host_data in HOSTS.items():
             if host_data["active_vip"] == target_ip:
                 matched_host_ip = host_ip
@@ -207,7 +229,6 @@ def handle_alert(packet):
 
         host = HOSTS[matched_host_ip]
 
-        # Debounce to prevent rapid overlapping mutations
         current_time = time.time()
         if current_time - host["last_mutation_time"] < 5.0:
             return
@@ -220,15 +241,35 @@ def handle_alert(packet):
         host["last_mutation_time"] = time.time()
         print("[*] Hopping complete. Network stabilized. Resuming IDS...\n")
 
-if __name__ == "__main__":
-    initialize_static_network()
-    print("\n[*] Establishing initial Virtual IPs (Patient Zero)...")
+def sniff_thread_worker(iface):
+    print(f"[*] Started Sniffing Thread on interface {iface}...")
+    try:
+        sniff(iface=iface, prn=handle_alert, store=False, filter="tcp")
+    except Exception as e:
+        print(f"[!] Sniffing failed on {iface}: {e}")
 
+if __name__ == "__main__":
+    load_config()
+    initialize_static_network()
+    
+    print("\n[*] Establishing initial Virtual IPs (Patient Zero)...")
     for host_ip in HOSTS:
         mutate_server(host_ip)
 
-    print(f"\n[*] Controller Active: Monitoring management port {SNIFF_IFACE}...")
+    print(f"\n[*] Controller Active: Monitoring {len(SNIFF_INTERFACES)} management interfaces...")
+    
+    threads = []
+    for iface in SNIFF_INTERFACES:
+        t = threading.Thread(target=sniff_thread_worker, args=(iface,), daemon=True)
+        t.start()
+        threads.append(t)
+        
     try:
-        sniff(iface=SNIFF_IFACE, prn=handle_alert, store=False, filter="tcp")
+        while True:
+            time.sleep(1)
+            # If all sniffing interfaces go down (e.g. Mininet exits), terminate the controller
+            if threads and not any(t.is_alive() for t in threads):
+                print("\n[*] All sniffing interfaces went down. Exiting controller.")
+                break
     except KeyboardInterrupt:
         print("\n[*] Controller stopped.")
