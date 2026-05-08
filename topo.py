@@ -42,10 +42,12 @@ class MTDTopo(Topo):
                 # Connect Host to Edge with explicit port
                 self.addLink(h, s_edge, port2=host["switch_port"])
 
-            # Add Dummy Sniff Port if MTD is enabled
             if edge.get("is_mtd", False) and "sniff_port" in edge:
                 sniff_host_name = f"{edge['name']}_ids"
-                h_sniff = self.addHost(sniff_host_name, ip='10.0.99.1/24', mac='00:04:00:00:00:99')
+                node_id = i + 1
+                sniff_ip = f'10.0.99.{node_id}/24'
+                sniff_mac = f'00:04:00:00:99:{node_id:02x}'
+                h_sniff = self.addHost(sniff_host_name, ip=sniff_ip, mac=sniff_mac)
                 self.host_names.append(sniff_host_name)
                 self.addLink(h_sniff, s_edge, port2=edge["sniff_port"])
 

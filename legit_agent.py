@@ -48,6 +48,7 @@ def load_config():
             for host in edge.get("hosts", []):
                 if host.get("type") == "server":
                     HOSTS[host["ip"]] = {
+                        "vip_subnet": edge["vip_subnet"],
                         "active_vip": None,
                         "port_offset": 0,
                         "services": {port: {"active_vport": None} for port in host.get("services", [])}
@@ -59,7 +60,10 @@ def calculate_virtual_ip(real_ip, seq_num):
     hash_object = hashlib.sha256(raw_string.encode('utf-8'))
     hash_int = int(hash_object.hexdigest(), 16)
     v_host = (hash_int % 253) + 1
-    return f"192.168.50.{v_host}"
+    
+    vip_subnet = HOSTS[real_ip]["vip_subnet"]
+    prefix = vip_subnet.rsplit('.', 1)[0]
+    return f"{prefix}.{v_host}"
 
 def calculate_port_offset(real_ip, seq_num):
     raw_string = f"PORT:{real_ip}:{SEED}:{seq_num}"
